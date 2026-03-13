@@ -63,7 +63,7 @@ async function callGroq(messages, keyIndex = 0) {
       body: JSON.stringify({
         model: 'llama-3.3-70b-versatile',
         messages,
-        max_tokens: 1500,
+        max_tokens: 2048,
         temperature: 0.8
       })
     });
