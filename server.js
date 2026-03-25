@@ -53,61 +53,50 @@ IMPORTANT: End every single answer with this exact footer:
 ${FOOTER}`
 };
 
-async function callGroq(messages, keyIndex = 0) {
-  if (keyIndex >= GROQ_KEYS.length) throw new Error('All Groq keys exhausted');
+async function streamGroq(messages, res, keyIndex = 0) {
+  if (keyIndex >= GROQ_KEYS.length) { res.write('data: [ERROR]\n\n'); res.end(); return; }
   try {
-    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${GROQ_KEYS[keyIndex]}`
-      },
-      body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
-        messages,
-        max_tokens: 2048,
-        temperature: 0.8
-      })
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_KEYS[keyIndex]}` },
+      body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages, max_tokens: 2048, temperature: 0.8, stream: true })
     });
-    if (res.status === 429 || res.status === 401) {
-      console.log(`Groq key ${keyIndex + 1} failed, trying next...`);
-      return callGroq(messages, keyIndex + 1);
+    if (groqRes.status === 429 || groqRes.status === 401) return streamGroq(messages, res, keyIndex + 1);
+    const reader = groqRes.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n'); buffer = lines.pop();
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith('data:')) continue;
+        const data = trimmed.slice(5).trim();
+        if (data === '[DONE]') { res.write(`data: ${JSON.stringify({ token: FOOTER })}\n\n`); res.write('data: [DONE]\n\n'); res.end(); return; }
+        try { const parsed = JSON.parse(data); const token = parsed.choices?.[0]?.delta?.content; if (token) res.write(`data: ${JSON.stringify({ token })}\n\n`); } catch(e) {}
+      }
     }
-    const data = await res.json();
-    return data.choices[0].message.content;
+    res.write('data: [DONE]\n\n'); res.end();
   } catch (err) {
-    if (keyIndex + 1 < GROQ_KEYS.length) return callGroq(messages, keyIndex + 1);
-    throw err;
+    if (keyIndex + 1 < GROQ_KEYS.length) return streamGroq(messages, res, keyIndex + 1);
+    res.write('data: [ERROR]\n\n'); res.end();
   }
 }
 
 async function callOpenRouter(messages, modelIndex = 0) {
-  const models = [
-    'nvidia/nemotron-nano-12b-v2-vl:free',
-    'google/gemma-3-27b-it:free',
-    'meta-llama/llama-3.3-70b-instruct:free'
-  ];
+  const models = ['nvidia/nemotron-nano-12b-v2-vl:free','google/gemma-3-27b-it:free','meta-llama/llama-3.3-70b-instruct:free'];
   if (modelIndex >= models.length) throw new Error('All OpenRouter models exhausted');
   try {
     const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENROUTER_KEY}`,
-        'HTTP-Referer': 'https://mrsmile-build.github.io/oya/',
-        'X-Title': 'OYA AI'
-      },
-      body: JSON.stringify({
-        model: models[modelIndex],
-        messages,
-        max_tokens: 2048
-      })
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENROUTER_KEY}`, 'HTTP-Referer': 'https://mrsmile-build.github.io/oya/', 'X-Title': 'OYA AI' },
+      body: JSON.stringify({ model: models[modelIndex], messages, max_tokens: 2048 })
     });
-    if (res.status === 429 || res.status === 400 || res.status === 503) {
-      return callOpenRouter(messages, modelIndex + 1);
-    }
+    if (res.status === 429 || res.status === 400 || res.status === 503) return callOpenRouter(messages, modelIndex + 1);
     const data = await res.json();
-    if (!data.choices || !data.choices[0]) return callOpenRouter(messages, modelIndex + 1);
+    if (!data.choices?.[0]) return callOpenRouter(messages, modelIndex + 1);
     return data.choices[0].message.content;
   } catch (err) {
     if (modelIndex + 1 < models.length) return callOpenRouter(messages, modelIndex + 1);
@@ -115,63 +104,67 @@ async function callOpenRouter(messages, modelIndex = 0) {
   }
 }
 
-app.get('/', (req, res) => {
-  res.json({
-    status: 'OYA backend is running!',
-    keys_loaded: GROQ_KEYS.length,
-    vision: OPENROUTER_KEY ? 'enabled' : 'disabled'
-  });
+async function getRecommendations(lastQuestion, lastAnswer, mode, keyIndex = 0) {
+  if (keyIndex >= GROQ_KEYS.length) return null;
+  try {
+    const prompt = `Based on this conversation:\nUser asked: "${lastQuestion}"\nOYA answered: "${lastAnswer.slice(0, 500)}..."\n\nGenerate exactly 3 short follow-up questions the user might want to ask next.\nRules:\n- Each question must be directly related to what was just discussed\n- Keep each question under 12 words\n- Make them natural and conversational\n- Return ONLY a JSON array like: ["question 1","question 2","question 3"]\n- No other text, no explanation, just the JSON array`;
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_KEYS[keyIndex]}` },
+      body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'user', content: prompt }], max_tokens: 200, temperature: 0.7 })
+    });
+    const data = await res.json();
+    const text = data.choices?.[0]?.message?.content?.trim();
+    if (!text) return null;
+    const parsed = JSON.parse(text.replace(/```json|```/g,'').trim());
+    if (Array.isArray(parsed) && parsed.length === 3) return parsed;
+    return null;
+  } catch(e) { return null; }
+}
+
+app.get('/', (req, res) => { res.json({ status: 'OYA backend is running!', keys_loaded: GROQ_KEYS.length, vision: OPENROUTER_KEY ? 'enabled' : 'disabled', streaming: 'enabled' }); });
+
+app.post('/ask-stream', async (req, res) => {
+  const { message, mode = 'learn', history = [], fileData, fileType } = req.body;
+  if (!message && !fileData) return res.status(400).json({ error: 'No message provided' });
+  const systemPrompt = SYSTEM_PROMPTS[mode] || SYSTEM_PROMPTS.learn;
+  const userMessage = message || 'What is in this image or file?';
+  if (fileData && fileType === 'image' && OPENROUTER_KEY) {
+    try {
+      const reply = await callOpenRouter([{ role: 'system', content: systemPrompt }, ...history.slice(-6), { role: 'user', content: [{ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${fileData}` } }, { type: 'text', text: userMessage }] }]);
+      return res.json({ reply: reply + FOOTER });
+    } catch(err) { return res.status(500).json({ error: 'Vision error, try again' }); }
+  }
+  if (fileData && fileType === 'text') {
+    try {
+      const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_KEYS[0]}` }, body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'system', content: systemPrompt }, ...history.slice(-6), { role: 'user', content: `File content:\n\n${fileData.slice(0,8000)}\n\n---\n${userMessage}` }], max_tokens: 2048, temperature: 0.8 }) });
+      const data = await groqRes.json();
+      return res.json({ reply: data.choices[0].message.content + FOOTER });
+    } catch(err) { return res.status(500).json({ error: 'File read error' }); }
+  }
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  await streamGroq([{ role: 'system', content: systemPrompt }, ...history.slice(-12), { role: 'user', content: userMessage }], res);
+});
+
+app.post('/recommendations', async (req, res) => {
+  const { question, answer, mode } = req.body;
+  if (!question || !answer) return res.json({ recommendations: null });
+  res.json({ recommendations: await getRecommendations(question, answer, mode) });
 });
 
 app.post('/ask', async (req, res) => {
-  const { message, mode = 'learn', history = [], fileData, fileType } = req.body;
-  if (!message && !fileData) return res.status(400).json({ error: 'No message provided' });
-
+  const { message, mode = 'learn', history = [] } = req.body;
+  if (!message) return res.status(400).json({ error: 'No message provided' });
   const systemPrompt = SYSTEM_PROMPTS[mode] || SYSTEM_PROMPTS.learn;
-  const userMessage = message || 'What is in this image or file?';
-
   try {
-    let reply;
-
-    if (fileData && fileType === 'image' && OPENROUTER_KEY) {
-      console.log('Routing to OpenRouter vision...');
-      const messages = [
-        { role: 'system', content: systemPrompt },
-        ...history.slice(-6),
-        {
-          role: 'user',
-          content: [
-            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${fileData}` } },
-            { type: 'text', text: userMessage }
-          ]
-        }
-      ];
-      reply = await callOpenRouter(messages);
-    }
-    else if (fileData && fileType === 'text') {
-      console.log('Routing text file to Groq...');
-      const messages = [
-        { role: 'system', content: systemPrompt },
-        ...history.slice(-6),
-        { role: 'user', content: `Here is the file content:\n\n${fileData.slice(0,8000)}\n\n---\n${userMessage}` }
-      ];
-      reply = await callGroq(messages);
-    }
-    else {
-      const messages = [
-        { role: 'system', content: systemPrompt },
-        ...history.slice(-12),
-        { role: 'user', content: userMessage }
-      ];
-      reply = await callGroq(messages);
-    }
-
-    res.json({ reply });
-  } catch (err) {
-    console.error('Error:', err);
-    res.status(500).json({ error: 'OYA is resting, try again in a moment' });
-  }
+    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_KEYS[0]}` }, body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'system', content: systemPrompt }, ...history.slice(-12), { role: 'user', content: message }], max_tokens: 2048, temperature: 0.8 }) });
+    const data = await groqRes.json();
+    res.json({ reply: data.choices[0].message.content + FOOTER });
+  } catch(err) { res.status(500).json({ error: 'OYA is resting, try again' }); }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`OYA backend running on port ${PORT} | Groq keys: ${GROQ_KEYS.length} | Vision: ${OPENROUTER_KEY ? 'ON' : 'OFF'}`));
+app.listen(PORT, () => console.log(`OYA backend running on port ${PORT} | Groq keys: ${GROQ_KEYS.length} | Vision: ${OPENROUTER_KEY ? 'ON' : 'OFF'} | Streaming: ON`));
